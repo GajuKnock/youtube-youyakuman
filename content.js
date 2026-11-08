@@ -1,6 +1,6 @@
 /**
- * YouTube Summary Saver - Content Script (Enhanced v3)
- * プロンプトや挨拶文を確実に除外し、純粋な要約本文のみを抽出します。
+ * YouTube Summary Saver - Content Script (Reviewed & Hardened)
+ * 厳密なDOM要素識別により、最後のAI回答のみを完全かつ安全に抽出します。
  */
 
 const SELECTORS = {
@@ -134,62 +134,31 @@ function linkifyTimestamps(text, videoUrl) {
 }
 
 /**
- * 挨拶文やユーザー送信プロンプトの完全除去
+ * 不要なUI要素を除外してクリーンアップ（正当な疑問文や文章は保持）
  */
-function stripPromptAndGreetings(text, promptText) {
-  if (!text) return '';
-
-  // 1. 挨拶や初期案内文の除去
-  text = text.replace(/こんにちは[^\n]*\n*/g, '');
-  text = text.replace(/何を質問すればいいかわからない場合[^\n]*\n*/g, '');
-  text = text.replace(/次のいずれかを選択してください[^\n]*\n*/g, '');
-
-  // 2. 送信したプロンプトの完全除去
-  if (promptText) {
-    const lines = promptText.trim().split('\n').map(l => l.trim()).filter(Boolean);
-    const lastLine = lines[lines.length - 1]; // "4. 【結論・まとめ】" 等
-    const idx = text.indexOf(lastLine);
-    if (idx !== -1) {
-      text = text.slice(idx + lastLine.length).trim();
-    }
-  }
-
-  // 3. 一般的なプロンプト断片の除去（フォールバック）
-  text = text.replace(/^[\s\S]*?(この動画の内容について[^\n]*|以下の構成で出力してください[^\n]*)/g, '');
-  text = text.replace(/^[\s\S]*?[0-9]+[\.、]\s*【[^】]+】\s*(?=[0-9]+[\.、]\s*【)/, '');
-
-  return text.trim();
-}
-
-function cleanExtractedText(rawText, videoUrl, promptText) {
+function cleanExtractedText(rawText, videoUrl) {
   if (!rawText) return '';
 
   let lines = rawText.split('\n').map(l => l.trim());
 
-  const ignorePatterns = [
-    /^この動画について質問する/i,
-    /^動画を要約して/i,
-    /^質問を入力/i,
-    /^Gemini\s*に質問する/i,
+  // 固定のヘッダーや操作文言のみを除外（正当な疑問文「?」や「教えてください」等は削除しない）
+  const ignoreExactHeaders = [
+    /^この動画について質問する$/i,
+    /^質問を入力$/i,
+    /^Gemini\s*に質問する$/i,
     /^AI\s*は不正確な情報を表示することがあるため/i,
-    /^詳細$/i,
-    /\?|？$/,
-    /教えてください$/,
-    /おすすめですか$/
+    /^詳細$/i
   ];
 
   lines = lines.filter(line => {
     if (!line) return false;
-    for (const pat of ignorePatterns) {
+    for (const pat of ignoreExactHeaders) {
       if (pat.test(line)) return false;
     }
     return true;
   });
 
   let text = lines.join('\n\n');
-
-  // プロンプトと挨拶文の切り落とし
-  text = stripPromptAndGreetings(text, promptText);
 
   // 箇条書き記号の正規化
   text = text.replace(/^[ \t]*[•▪■・][ \t]*/gm, '- ');
@@ -204,83 +173,135 @@ function cleanExtractedText(rawText, videoUrl, promptText) {
 }
 
 /**
- * AI回答ブロックを優先特定して抽出
+ * パネル内からすべての「AI回答要素」を要素単位で特定して取得
+ * @param {Element} panel
+ * @returns {Element[]} AI回答要素のリスト（古い順）
  */
-function findBestSummaryText(panel, videoUrl, promptText) {
+function getAllAiResponseElements(panel) {
+  if (!panel) return [];
   const root = panel.shadowRoot || panel;
 
-  // 1. Sparkle（✨）アイコンを基準にしたAI回答コンテナの特定
-  // AI回答の直前・直上にはキラキラアイコン（Gemini/Sparkle）がある
-  const sparkles = Array.from(root.querySelectorAll('yt-icon, svg, [icon*="sparkle" i], [class*="sparkle" i]'));
-  for (const sp of sparkles) {
-    // 兄弟要素または親要素から回答ブロックを取得
-    const parentContainer = sp.closest('[class*="response" i], [class*="turn" i], [class*="model" i], [class*="item" i]') || sp.parentElement;
-    if (parentContainer && parentContainer !== panel) {
-      const text = parentContainer.innerText || parentContainer.textContent || '';
-      if (text.length > 80 && !text.includes('質問を入力')) {
-        const cleaned = cleanExtractedText(text, videoUrl, promptText);
-        if (cleaned.length > 50) {
-          return cleaned;
-        }
+  // 1. 明示的なタグ・セレクタによる探索
+  const candidateSelectors = [
+    'ytd-conversational-ai-response-renderer',
+    'you-chat-item-view-model:not([class*="user" i]):not([is-user])',
+    'yt-convo-item-view-model:not([class*="user" i])',
+    'ytd-chat-item-renderer:not([class*="user" i])'
+  ];
+
+  for (const sel of candidateSelectors) {
+    try {
+      const found = Array.from(root.querySelectorAll(sel));
+      if (found.length > 0) {
+        return found;
       }
+    } catch {}
+  }
+
+  // 2. Sparkle（✨）アイコンからAI回答ブロックを特定
+  const allIcons = Array.from(root.querySelectorAll('yt-icon, svg, [icon*="sparkle" i], [class*="sparkle" i]'));
+  const sparkleIcons = allIcons.filter(icon => {
+    const iconAttr = (icon.getAttribute('icon') || '').toLowerCase();
+    const classAttr = (icon.getAttribute('class') || '').toLowerCase();
+    const html = (icon.innerHTML || '').toLowerCase();
+    return iconAttr.includes('sparkle') ||
+           iconAttr.includes('gemini') ||
+           iconAttr.includes('auto-awesome') ||
+           classAttr.includes('sparkle') ||
+           html.includes('sparkle') ||
+           html.includes('m19 9l1.25'); // Sparkle SVG path
+  });
+
+  if (sparkleIcons.length > 0) {
+    const aiBlocks = [];
+    for (const icon of sparkleIcons) {
+      // 祖先を遡り、独立した回答コンテナを見つける
+      let current = icon.parentElement;
+      let bestBlock = null;
+
+      while (current && current !== panel && current !== root && current.tagName.toLowerCase() !== 'body') {
+        const tag = current.tagName.toLowerCase();
+        // ヘッダーや入力欄、提案チップはスキップ
+        if (current.id === 'header' || tag.includes('chip') || current.querySelector('textarea, input')) {
+          break;
+        }
+
+        // 回答コンテナの候補
+        if (current.clientHeight > 40) {
+          bestBlock = current;
+          // 特定のクラスやタグがあれば確定
+          if (current.classList.contains('response') || tag.includes('item') || tag.includes('turn')) {
+            break;
+          }
+        }
+        current = current.parentElement;
+      }
+
+      if (bestBlock && !aiBlocks.includes(bestBlock)) {
+        aiBlocks.push(bestBlock);
+      }
+    }
+
+    if (aiBlocks.length > 0) {
+      return aiBlocks;
     }
   }
 
-  // 2. クローンから不要なUIおよびユーザープロンプト要素を削除
-  const clone = panel.cloneNode(true);
+  // 3. チャットスレッドの要素一覧からユーザーメッセージを除外して探索
+  const threadContainer = root.querySelector('#contents, #items, [class*="chat-history" i], [class*="messages" i]');
+  if (threadContainer && threadContainer.children.length > 0) {
+    const turns = Array.from(threadContainer.children).filter(child => {
+      // ヘッダー・チップ・入力欄を除外
+      const tag = child.tagName.toLowerCase();
+      if (tag.includes('chip') || child.querySelector('textarea, input, [class*="chip" i]')) return false;
+      if (child.id === 'header') return false;
+      // ユーザー発言要素を除外
+      const isUser = child.matches('[class*="user" i], [class*="query" i]') ||
+                     child.querySelector('[class*="user" i], [class*="query" i]') !== null;
+      if (isUser) return false;
 
+      return (child.textContent || '').trim().length > 30;
+    });
+
+    if (turns.length > 0) {
+      return turns;
+    }
+  }
+
+  return [];
+}
+
+/**
+ * 単一のAI回答要素から純粋な要約本文を抽出する
+ * @param {Element} aiElement
+ * @param {string} videoUrl
+ * @returns {string}
+ */
+function extractSummaryFromAiElement(aiElement, videoUrl) {
+  if (!aiElement) return '';
+
+  // クローンを作成して、要素内部のボタンやフィードバックUIを除去
+  const clone = aiElement.cloneNode(true);
   const removeSelectors = [
     'button',
     'yt-icon',
     'svg',
     'tp-yt-paper-tooltip',
-    'yt-chip-cloud-renderer',
-    'yt-chip-cloud-chip-renderer',
-    'ytd-comment-simplebox-renderer',
-    'textarea',
-    'input',
-    '#header',
-    '.ytd-engagement-panel-title-header-renderer',
-    '[class*="chip" i]',
-    '[class*="suggestion" i]',
-    '[class*="input" i]',
-    '[class*="disclaimer" i]',
     '[class*="feedback" i]',
     '[class*="action-bar" i]',
-    // ユーザー発言・クエリ要素
-    '[class*="user-query" i]',
-    '[class*="user-turn" i]',
-    '[class*="user-message" i]'
+    '[class*="disclaimer" i]',
+    'ytd-menu-renderer'
   ];
 
   for (const sel of removeSelectors) {
     try {
-      const elements = clone.querySelectorAll(sel);
-      elements.forEach(el => el.remove());
+      const els = clone.querySelectorAll(sel);
+      els.forEach(el => el.remove());
     } catch {}
   }
 
   const rawText = clone.innerText || clone.textContent || '';
-  const cleaned = cleanExtractedText(rawText, videoUrl, promptText);
-
-  if (cleaned && cleaned.length > 50) {
-    return cleaned;
-  }
-
-  // 3. パネル内の全p/div要素の中から一番文字数が多いブロック
-  const allElements = Array.from(panel.querySelectorAll('div, p, yt-formatted-string, yt-core-attributed-string'));
-  let maxText = '';
-  for (const el of allElements) {
-    if (el.closest('yt-chip-cloud-renderer, yt-chip-cloud-chip-renderer, textarea, input, button, #header')) {
-      continue;
-    }
-    const t = el.innerText?.trim() || '';
-    if (t.length > maxText.length && !t.includes('質問を入力')) {
-      maxText = t;
-    }
-  }
-
-  return cleanExtractedText(maxText, videoUrl, promptText);
+  return cleanExtractedText(rawText, videoUrl);
 }
 
 function findInputAndSendButton(panel) {
@@ -299,21 +320,19 @@ function findInputAndSendButton(panel) {
   return { inputEl, sendBtn };
 }
 
+/**
+ * 自動化状態の管理
+ */
 let automationState = {
   active: false,
   startTime: 0,
-  promptSent: false,
-  lastPrompt: ''
+  initialAiCount: 0
 };
 
+/**
+ * 自動要約の開始
+ */
 async function autoStartSummarize(promptText) {
-  automationState = {
-    active: true,
-    startTime: Date.now(),
-    promptSent: false,
-    lastPrompt: promptText
-  };
-
   let panel = findActiveAskPanel();
   if (!panel) {
     const btn = findAskTriggerButton();
@@ -342,6 +361,14 @@ async function autoStartSummarize(promptText) {
       message: '質問パネルの展開に失敗しました。手動でパネルを開いてからお試しください。'
     };
   }
+
+  // 送信前のAI回答数を正確に記録（古い回答を新回答と誤判定しないため）
+  const initialElements = getAllAiResponseElements(panel);
+  automationState = {
+    active: true,
+    startTime: Date.now(),
+    initialAiCount: initialElements.length
+  };
 
   await new Promise(r => setTimeout(r, 500));
   const { inputEl, sendBtn } = findInputAndSendButton(panel);
@@ -382,7 +409,6 @@ async function autoStartSummarize(promptText) {
       inputEl.dispatchEvent(enterEvent);
     }
 
-    automationState.promptSent = true;
     return { success: true, status: 'PROMPT_SENT' };
   } catch (err) {
     return {
@@ -394,36 +420,56 @@ async function autoStartSummarize(promptText) {
   }
 }
 
+/**
+ * 生成状況のチェック（タイムアウト最優先判定＆新回答の監視）
+ */
 function checkAutomationStatus() {
   const panel = findActiveAskPanel();
   if (!panel) {
     return { status: 'PANEL_CLOSED' };
   }
 
-  const isGenerating = checkIsGenerating(panel);
   const elapsedSec = Math.floor((Date.now() - automationState.startTime) / 1000);
 
+  // 【修正点4】タイムアウトを最優先で判定（生成中表示が残っていても90秒で確実に終了）
+  if (elapsedSec >= 90) {
+    return { status: 'TIMEOUT', elapsedSec };
+  }
+
+  // 送信直後（最初の3秒間）は待機
   if (elapsedSec < 3) {
     return { status: 'GENERATING', elapsedSec };
   }
 
+  // 【修正点2】送信前の回答数と比較し、新しい回答がDOMに追加されたか確認
+  const currentAiElements = getAllAiResponseElements(panel);
+  if (currentAiElements.length <= automationState.initialAiCount) {
+    // まだ新しい回答要素が生成されていない
+    return { status: 'GENERATING', elapsedSec };
+  }
+
+  // 生成中スピナーのチェック
+  const isGenerating = checkIsGenerating(panel);
   if (isGenerating) {
     return { status: 'GENERATING', elapsedSec };
   }
 
-  const text = findBestSummaryText(panel, getCleanVideoUrl(), automationState.lastPrompt);
-  if (text && text.length > 50) {
+  // 最新のAI回答要素を取得し、本文が十分に出力されたか確認
+  const latestAiEl = currentAiElements[currentAiElements.length - 1];
+  const videoUrl = getCleanVideoUrl();
+  const summaryText = extractSummaryFromAiElement(latestAiEl, videoUrl);
+
+  if (summaryText && summaryText.length >= 40) {
     return { status: 'COMPLETED', elapsedSec };
   }
 
-  if (elapsedSec < 90) {
-    return { status: 'GENERATING', elapsedSec };
-  }
-
-  return { status: 'TIMEOUT', elapsedSec };
+  return { status: 'GENERATING', elapsedSec };
 }
 
-function extractSummaryData(promptText) {
+/**
+ * 要約データの抽出（最後のAI回答のみを厳格に取得）
+ */
+function extractSummaryData() {
   const isYouTube = window.location.hostname.includes('youtube.com');
   const isWatchPage = window.location.pathname === '/watch' || window.location.search.includes('v=');
 
@@ -463,14 +509,27 @@ function extractSummaryData(promptText) {
     };
   }
 
-  const finalMarkdown = findBestSummaryText(panel, videoUrl, promptText || automationState.lastPrompt);
+  // 【修正点1・2】AI回答要素一覧を取得し、「最後のAI回答のみ」を厳密に対象とする
+  const aiElements = getAllAiResponseElements(panel);
+  if (!aiElements || aiElements.length === 0) {
+    return {
+      success: false,
+      errorType: 'AI_RESPONSE_NOT_FOUND',
+      title: 'AI回答が見つかりません',
+      message: 'パネル内にAIの回答が表示されていません。回答が出力されてから再度実行してください。'
+    };
+  }
+
+  // 常に「最後のAI回答要素」だけを取得
+  const latestAiEl = aiElements[aiElements.length - 1];
+  const finalMarkdown = extractSummaryFromAiElement(latestAiEl, videoUrl);
 
   if (!finalMarkdown || finalMarkdown.length < 20) {
     return {
       success: false,
       errorType: 'EMPTY_CONTENT',
       title: '要約本文の取得に失敗しました',
-      message: '質問パネル内に要約テキストが検出されませんでした。画面に回答が表示されているかご確認ください。'
+      message: 'AI回答要素から本文テキストを読み取れませんでした。画面に回答が表示されているかご確認ください。'
     };
   }
 
@@ -506,7 +565,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   if (request.action === 'EXTRACT_SUMMARY') {
     try {
-      const result = extractSummaryData(request.prompt);
+      const result = extractSummaryData();
       sendResponse(result);
     } catch (err) {
       sendResponse({

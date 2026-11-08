@@ -177,7 +177,10 @@ async function sendMessageToContentScript(tabId, message) {
  * 共通の抽出＆ダウンロード処理
  */
 async function processExtractionAndDownload(tabId) {
-  const response = await sendMessageToContentScript(tabId, { action: 'EXTRACT_SUMMARY' });
+  const response = await sendMessageToContentScript(tabId, {
+    action: 'EXTRACT_SUMMARY',
+    prompt: currentPrompt
+  });
 
   if (!response || !response.success) {
     showError(response || {

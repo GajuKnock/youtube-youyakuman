@@ -1,6 +1,6 @@
 /**
- * YouTube Summary Saver - Content Script (Reviewed & Hardened)
- * 厳密なDOM要素識別により、最後のAI回答のみを完全かつ安全に抽出します。
+ * YouTube Summary Saver - Content Script (v1.2 Stable)
+ * 確実なテキスト抽出・ストリーミング完了検知・全文保持を実現します。
  */
 
 const SELECTORS = {
@@ -19,12 +19,6 @@ const SELECTORS = {
     'ytd-video-owner-renderer #channel-name a',
     '#channel-name yt-formatted-string a',
     '#channel-name a'
-  ],
-  panel: [
-    'ytd-engagement-panel-section-list-renderer[target-id="PAyouchat"]',
-    'ytd-engagement-panel-section-list-renderer[target-id*="youchat" i]',
-    'ytd-engagement-panel-section-list-renderer[target-id*="ask" i]',
-    'ytd-engagement-panel-section-list-renderer[visibility="EXPANDED"]'
   ],
   generating: [
     'tp-yt-paper-spinner[active]',
@@ -134,31 +128,86 @@ function linkifyTimestamps(text, videoUrl) {
 }
 
 /**
- * 不要なUI要素を除外してクリーンアップ（正当な疑問文や文章は保持）
+ * 正規表現のエスケープ
  */
-function cleanExtractedText(rawText, videoUrl) {
+function escapeRegExp(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * テキストからプロンプト全文の塊および初期挨拶のみを安全に除去
+ * （AI回答内の見出しや正当な文章は一切削除しない）
+ */
+function stripSentPromptSafely(text, promptText) {
+  if (!text) return '';
+
+  // 1. パネル初期表示の固定システム案内文のみを先頭から除去
+  text = text.replace(/^\s*こんにちは。視聴しているコンテンツについて、ご質問にお答えします。\s*/g, '');
+  text = text.replace(/^\s*何を質問すればいいかわからない場合、次のいずれかを選択してください。\s*/g, '');
+
+  // 2. 送信されたプロンプト全文が含まれている場合、最後に出現するプロンプト塊の直後（＝最新のAI回答）を取得
+  if (promptText && promptText.trim().length > 10) {
+    const promptLines = promptText.trim().split('\n').map(l => l.trim()).filter(Boolean);
+    if (promptLines.length >= 2) {
+      const firstLine = escapeRegExp(promptLines[0]);
+      const lastLine = escapeRegExp(promptLines[promptLines.length - 1]);
+      // プロンプトの先頭行から末尾行までの最短一致パターン（AI回答内の見出しにはマッチしない）
+      const fullPromptPattern = new RegExp(`${firstLine}[\\s\\S]*?${lastLine}`, 'g');
+      
+      let match;
+      let lastEndIndex = -1;
+      while ((match = fullPromptPattern.exec(text)) !== null) {
+        lastEndIndex = match.index + match[0].length;
+      }
+
+      if (lastEndIndex !== -1) {
+        // 最後のプロンプトの直後から末尾まで（＝最新のAI回答全文）を切り出す
+        text = text.slice(lastEndIndex).trim();
+      }
+    } else if (promptLines.length === 1) {
+      const singlePrompt = promptLines[0];
+      const lastIdx = text.lastIndexOf(singlePrompt);
+      if (lastIdx !== -1) {
+        text = text.slice(lastIdx + singlePrompt.length).trim();
+      }
+    }
+  }
+
+  // 3. デフォルトの「動画を要約して」ボタンで生成した場合の先頭プロンプト除去
+  text = text.replace(/^\s*動画を要約して\s*\n+/, '');
+
+  return text.trim();
+}
+
+/**
+ * 抽出したテキストを整形（回答内の疑問文や見出しは保持）
+ */
+function cleanExtractedText(rawText, videoUrl, promptText) {
   if (!rawText) return '';
 
   let lines = rawText.split('\n').map(l => l.trim());
 
-  // 固定のヘッダーや操作文言のみを除外（正当な疑問文「?」や「教えてください」等は削除しない）
-  const ignoreExactHeaders = [
+  // パネル枠のUIラベルのみを完全一致で除外（回答本文の疑問文「?」等は絶対に削除しない）
+  const uiLabels = [
     /^この動画について質問する$/i,
     /^質問を入力$/i,
     /^Gemini\s*に質問する$/i,
-    /^AI\s*は不正確な情報を表示することがあるため/i,
+    /^AI\s*は不正確な情報を表示することがあるため[^\n]*$/i,
     /^詳細$/i
   ];
 
   lines = lines.filter(line => {
     if (!line) return false;
-    for (const pat of ignoreExactHeaders) {
+    for (const pat of uiLabels) {
       if (pat.test(line)) return false;
     }
     return true;
   });
 
   let text = lines.join('\n\n');
+
+  // プロンプト塊の安全な除去（最新回答の抽出）
+  text = stripSentPromptSafely(text, promptText);
 
   // 箇条書き記号の正規化
   text = text.replace(/^[ \t]*[•▪■・][ \t]*/gm, '- ');
@@ -173,135 +222,49 @@ function cleanExtractedText(rawText, videoUrl) {
 }
 
 /**
- * パネル内からすべての「AI回答要素」を要素単位で特定して取得
- * @param {Element} panel
- * @returns {Element[]} AI回答要素のリスト（古い順）
+ * パネルから不要なUI要素（ボタン・提案チップ・入力欄）を除いたテキストを取得
  */
-function getAllAiResponseElements(panel) {
-  if (!panel) return [];
-  const root = panel.shadowRoot || panel;
+function extractPanelSummaryText(panel, videoUrl, promptText) {
+  if (!panel) return '';
 
-  // 1. 明示的なタグ・セレクタによる探索
-  const candidateSelectors = [
-    'ytd-conversational-ai-response-renderer',
-    'you-chat-item-view-model:not([class*="user" i]):not([is-user])',
-    'yt-convo-item-view-model:not([class*="user" i])',
-    'ytd-chat-item-renderer:not([class*="user" i])'
-  ];
+  const clone = panel.cloneNode(true);
 
-  for (const sel of candidateSelectors) {
-    try {
-      const found = Array.from(root.querySelectorAll(sel));
-      if (found.length > 0) {
-        return found;
-      }
-    } catch {}
-  }
-
-  // 2. Sparkle（✨）アイコンからAI回答ブロックを特定
-  const allIcons = Array.from(root.querySelectorAll('yt-icon, svg, [icon*="sparkle" i], [class*="sparkle" i]'));
-  const sparkleIcons = allIcons.filter(icon => {
-    const iconAttr = (icon.getAttribute('icon') || '').toLowerCase();
-    const classAttr = (icon.getAttribute('class') || '').toLowerCase();
-    const html = (icon.innerHTML || '').toLowerCase();
-    return iconAttr.includes('sparkle') ||
-           iconAttr.includes('gemini') ||
-           iconAttr.includes('auto-awesome') ||
-           classAttr.includes('sparkle') ||
-           html.includes('sparkle') ||
-           html.includes('m19 9l1.25'); // Sparkle SVG path
-  });
-
-  if (sparkleIcons.length > 0) {
-    const aiBlocks = [];
-    for (const icon of sparkleIcons) {
-      // 祖先を遡り、独立した回答コンテナを見つける
-      let current = icon.parentElement;
-      let bestBlock = null;
-
-      while (current && current !== panel && current !== root && current.tagName.toLowerCase() !== 'body') {
-        const tag = current.tagName.toLowerCase();
-        // ヘッダーや入力欄、提案チップはスキップ
-        if (current.id === 'header' || tag.includes('chip') || current.querySelector('textarea, input')) {
-          break;
-        }
-
-        // 回答コンテナの候補
-        if (current.clientHeight > 40) {
-          bestBlock = current;
-          // 特定のクラスやタグがあれば確定
-          if (current.classList.contains('response') || tag.includes('item') || tag.includes('turn')) {
-            break;
-          }
-        }
-        current = current.parentElement;
-      }
-
-      if (bestBlock && !aiBlocks.includes(bestBlock)) {
-        aiBlocks.push(bestBlock);
-      }
-    }
-
-    if (aiBlocks.length > 0) {
-      return aiBlocks;
-    }
-  }
-
-  // 3. チャットスレッドの要素一覧からユーザーメッセージを除外して探索
-  const threadContainer = root.querySelector('#contents, #items, [class*="chat-history" i], [class*="messages" i]');
-  if (threadContainer && threadContainer.children.length > 0) {
-    const turns = Array.from(threadContainer.children).filter(child => {
-      // ヘッダー・チップ・入力欄を除外
-      const tag = child.tagName.toLowerCase();
-      if (tag.includes('chip') || child.querySelector('textarea, input, [class*="chip" i]')) return false;
-      if (child.id === 'header') return false;
-      // ユーザー発言要素を除外
-      const isUser = child.matches('[class*="user" i], [class*="query" i]') ||
-                     child.querySelector('[class*="user" i], [class*="query" i]') !== null;
-      if (isUser) return false;
-
-      return (child.textContent || '').trim().length > 30;
-    });
-
-    if (turns.length > 0) {
-      return turns;
-    }
-  }
-
-  return [];
-}
-
-/**
- * 単一のAI回答要素から純粋な要約本文を抽出する
- * @param {Element} aiElement
- * @param {string} videoUrl
- * @returns {string}
- */
-function extractSummaryFromAiElement(aiElement, videoUrl) {
-  if (!aiElement) return '';
-
-  // クローンを作成して、要素内部のボタンやフィードバックUIを除去
-  const clone = aiElement.cloneNode(true);
+  // ボタン、提案チップ、入力欄、ヘッダー、免責事項をDOMレベルで削除
   const removeSelectors = [
     'button',
     'yt-icon',
     'svg',
     'tp-yt-paper-tooltip',
+    'yt-chip-cloud-renderer',
+    'yt-chip-cloud-chip-renderer',
+    'ytd-comment-simplebox-renderer',
+    'textarea',
+    'input',
+    '#header',
+    '.ytd-engagement-panel-title-header-renderer',
+    '[class*="chip" i]',
+    '[class*="suggestion" i]',
+    '[class*="input" i]',
+    '[class*="disclaimer" i]',
     '[class*="feedback" i]',
     '[class*="action-bar" i]',
-    '[class*="disclaimer" i]',
-    'ytd-menu-renderer'
+    '[role="button"]'
   ];
 
   for (const sel of removeSelectors) {
     try {
-      const els = clone.querySelectorAll(sel);
-      els.forEach(el => el.remove());
+      const elements = clone.querySelectorAll(sel);
+      elements.forEach(el => el.remove());
     } catch {}
   }
 
-  const rawText = clone.innerText || clone.textContent || '';
-  return cleanExtractedText(rawText, videoUrl);
+  // cloneのinnerTextまたはパネルの可視テキストを取得
+  let rawText = clone.innerText || clone.textContent || '';
+  if (!rawText || rawText.trim().length < 20) {
+    rawText = panel.innerText || panel.textContent || '';
+  }
+
+  return cleanExtractedText(rawText, videoUrl, promptText);
 }
 
 function findInputAndSendButton(panel) {
@@ -326,7 +289,10 @@ function findInputAndSendButton(panel) {
 let automationState = {
   active: false,
   startTime: 0,
-  initialAiCount: 0
+  lastPrompt: '',
+  baselineText: '',
+  lastSeenLength: 0,
+  stableCount: 0
 };
 
 /**
@@ -362,12 +328,17 @@ async function autoStartSummarize(promptText) {
     };
   }
 
-  // 送信前のAI回答数を正確に記録（古い回答を新回答と誤判定しないため）
-  const initialElements = getAllAiResponseElements(panel);
+  // 送信前のパネル内テキストを記録（古い回答と新しい回答を確実に区別するため）
+  const videoUrl = getCleanVideoUrl();
+  const baseline = extractPanelSummaryText(panel, videoUrl, promptText);
+
   automationState = {
     active: true,
     startTime: Date.now(),
-    initialAiCount: initialElements.length
+    lastPrompt: promptText,
+    baselineText: baseline,
+    lastSeenLength: 0,
+    stableCount: 0
   };
 
   await new Promise(r => setTimeout(r, 500));
@@ -421,7 +392,7 @@ async function autoStartSummarize(promptText) {
 }
 
 /**
- * 生成状況のチェック（タイムアウト最優先判定＆新回答の監視）
+ * 生成状況のチェック（タイムアウト最優先＆ストリーミング安定完了検知）
  */
 function checkAutomationStatus() {
   const panel = findActiveAskPanel();
@@ -431,35 +402,42 @@ function checkAutomationStatus() {
 
   const elapsedSec = Math.floor((Date.now() - automationState.startTime) / 1000);
 
-  // 【修正点4】タイムアウトを最優先で判定（生成中表示が残っていても90秒で確実に終了）
+  // 1. タイムアウトを最優先で判定（90秒経過で確実に待機終了）
   if (elapsedSec >= 90) {
     return { status: 'TIMEOUT', elapsedSec };
   }
 
-  // 送信直後（最初の3秒間）は待機
-  if (elapsedSec < 3) {
+  // 送信直後（最初の4秒間）は生成開始待ち
+  if (elapsedSec < 4) {
     return { status: 'GENERATING', elapsedSec };
   }
 
-  // 【修正点2】送信前の回答数と比較し、新しい回答がDOMに追加されたか確認
-  const currentAiElements = getAllAiResponseElements(panel);
-  if (currentAiElements.length <= automationState.initialAiCount) {
-    // まだ新しい回答要素が生成されていない
+  // スピナー表示中なら生成中
+  if (checkIsGenerating(panel)) {
+    automationState.stableCount = 0;
     return { status: 'GENERATING', elapsedSec };
   }
 
-  // 生成中スピナーのチェック
-  const isGenerating = checkIsGenerating(panel);
-  if (isGenerating) {
-    return { status: 'GENERATING', elapsedSec };
-  }
-
-  // 最新のAI回答要素を取得し、本文が十分に出力されたか確認
-  const latestAiEl = currentAiElements[currentAiElements.length - 1];
+  // 現在の最新回答テキストを取得
   const videoUrl = getCleanVideoUrl();
-  const summaryText = extractSummaryFromAiElement(latestAiEl, videoUrl);
+  const currentSummary = extractPanelSummaryText(panel, videoUrl, automationState.lastPrompt);
 
-  if (summaryText && summaryText.length >= 40) {
+  // 2. 送信前の古い回答と同一、またはまだ50文字未満の場合は生成中として待機
+  if (!currentSummary || currentSummary.length < 50 || currentSummary === automationState.baselineText) {
+    automationState.stableCount = 0;
+    return { status: 'GENERATING', elapsedSec };
+  }
+
+  // 3. ストリーミング出力が完全に止まったか（文字数が安定したか）を確認
+  if (currentSummary.length === automationState.lastSeenLength) {
+    automationState.stableCount += 1;
+  } else {
+    automationState.lastSeenLength = currentSummary.length;
+    automationState.stableCount = 1;
+  }
+
+  // 2回連続（約3秒間）文字数が変化せず安定していれば、生成完了と判定！
+  if (automationState.stableCount >= 2) {
     return { status: 'COMPLETED', elapsedSec };
   }
 
@@ -467,9 +445,9 @@ function checkAutomationStatus() {
 }
 
 /**
- * 要約データの抽出（最後のAI回答のみを厳格に取得）
+ * 要約データの抽出
  */
-function extractSummaryData() {
+function extractSummaryData(promptText) {
   const isYouTube = window.location.hostname.includes('youtube.com');
   const isWatchPage = window.location.pathname === '/watch' || window.location.search.includes('v=');
 
@@ -509,27 +487,15 @@ function extractSummaryData() {
     };
   }
 
-  // 【修正点1・2】AI回答要素一覧を取得し、「最後のAI回答のみ」を厳密に対象とする
-  const aiElements = getAllAiResponseElements(panel);
-  if (!aiElements || aiElements.length === 0) {
-    return {
-      success: false,
-      errorType: 'AI_RESPONSE_NOT_FOUND',
-      title: 'AI回答が見つかりません',
-      message: 'パネル内にAIの回答が表示されていません。回答が出力されてから再度実行してください。'
-    };
-  }
-
-  // 常に「最後のAI回答要素」だけを取得
-  const latestAiEl = aiElements[aiElements.length - 1];
-  const finalMarkdown = extractSummaryFromAiElement(latestAiEl, videoUrl);
+  const activePrompt = promptText || automationState.lastPrompt;
+  const finalMarkdown = extractPanelSummaryText(panel, videoUrl, activePrompt);
 
   if (!finalMarkdown || finalMarkdown.length < 20) {
     return {
       success: false,
       errorType: 'EMPTY_CONTENT',
       title: '要約本文の取得に失敗しました',
-      message: 'AI回答要素から本文テキストを読み取れませんでした。画面に回答が表示されているかご確認ください。'
+      message: '質問パネル内に要約テキストが検出されませんでした。画面に回答が表示されているかご確認ください。'
     };
   }
 
@@ -565,7 +531,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   if (request.action === 'EXTRACT_SUMMARY') {
     try {
-      const result = extractSummaryData();
+      const result = extractSummaryData(request.prompt);
       sendResponse(result);
     } catch (err) {
       sendResponse({

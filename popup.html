@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Youtube 要約マン</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <!-- ヘッダー -->
+    <header class="header">
+      <div class="logo">
+        <svg class="icon-sparkle" viewBox="0 0 24 24" fill="currentColor">
+          <path d="M19 9l1.25-2.75L23 5l-2.75-1.25L19 1l-1.25 2.75L15 5l2.75 1.25L19 9zm-7.5.5L9 4 6.5 9.5 1 12l5.5 2.5L9 20l2.5-5.5L17 12l-5.5-2.5zM19 15l-1.25 2.75L15 19l2.75 1.25L19 23l1.25-2.75L23 19l-2.75-1.25L19 15z"/>
+        </svg>
+        <span class="logo-title">Youtube 要約マン</span>
+      </div>
+      <span class="badge">v1.1 (自動化)</span>
+    </header>
+
+    <!-- アクションセクション -->
+    <div class="action-section">
+      <!-- ワンクリック自動化ボタン -->
+      <button id="auto-btn" class="primary-btn auto-btn">
+        <svg class="btn-icon" viewBox="0 0 24 24" fill="currentColor">
+          <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14H9v-2h2v2zm0-4H9V7h2v5zm4 4h-2v-6h2v6zm4 0h-2v-4h2v4z"/>
+        </svg>
+        <span>✨ ワンクリックで詳細要約＆保存</span>
+      </button>
+
+      <!-- 手動保存（既存機能） -->
+      <button id="manual-btn" class="secondary-btn">
+        <span>表示中の要約をそのまま保存</span>
+      </button>
+    </div>
+
+    <!-- 進行状況カード -->
+    <div id="loading" class="state-card loading-state hidden">
+      <div class="spinner"></div>
+      <p id="loading-status" class="state-text">処理を開始しています...</p>
+      <span id="loading-timer" class="timer-text"></span>
+    </div>
+
+    <!-- 成功カード -->
+    <div id="success-card" class="state-card success-card hidden">
+      <div class="state-header success">
+        <svg class="state-icon" viewBox="0 0 24 24" fill="currentColor">
+          <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
+        </svg>
+        <span class="state-title">詳細要約の保存が完了！</span>
+      </div>
+      <div class="result-details">
+        <div class="meta-row">
+          <span class="meta-label">タイトル:</span>
+          <span id="result-title" class="meta-value"></span>
+        </div>
+        <div class="meta-row">
+          <span class="meta-label">チャンネル:</span>
+          <span id="result-channel" class="meta-value"></span>
+        </div>
+        <div class="meta-row">
+          <span class="meta-label">ファイル:</span>
+          <span id="result-filename" class="meta-value file-badge"></span>
+        </div>
+        <div class="preview-box">
+          <span class="preview-label">要約プレビュー:</span>
+          <p id="result-preview" class="preview-content"></p>
+        </div>
+      </div>
+    </div>
+
+    <!-- エラーカード -->
+    <div id="error-card" class="state-card error-card hidden">
+      <div class="state-header error">
+        <svg class="state-icon" viewBox="0 0 24 24" fill="currentColor">
+          <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/>
+        </svg>
+        <span id="error-title" class="state-title">実行できませんでした</span>
+      </div>
+      <p id="error-message" class="error-message-text"></p>
+      <div class="error-guidance">
+        <span class="guidance-title">必要な操作:</span>
+        <ul id="error-instructions" class="guidance-list"></ul>
+      </div>
+    </div>
+
+    <!-- プロンプト設定アコーディオン -->
+    <details class="settings-accordion">
+      <summary class="settings-summary">
+        <span>⚙️ 要約指示プロンプトの設定</span>
+      </summary>
+      <div class="settings-content">
+        <p class="settings-desc">自動送信する要約指示をカスタマイズできます。</p>
+        <textarea id="prompt-input" class="prompt-textarea" rows="6"></textarea>
+        <div class="settings-buttons">
+          <button id="save-prompt-btn" class="mini-btn primary">設定を保存</button>
+          <button id="reset-prompt-btn" class="mini-btn">初期設定に戻す</button>
+        </div>
+        <span id="prompt-saved-msg" class="saved-msg hidden">✓ 保存しました</span>
+      </div>
+    </details>
+  </div>
+
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

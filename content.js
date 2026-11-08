@@ -1,6 +1,7 @@
 /**
- * YouTube Summary Saver - Content Script (v1.2 Stable)
- * 確実なテキスト抽出・ストリーミング完了検知・全文保持を実現します。
+ * YouTube Summary Saver - Content Script (v1.3 Copy-Button Anchor Architecture)
+ * AI回答直下の「コピーボタン（アクションバー）」を目印（アンカー）として、
+ * 質問文・初期挨拶・提案チップを一切含まない「最新のAI回答本文DOM」のみを直接特定・抽出します。
  */
 
 const SELECTORS = {
@@ -27,6 +28,13 @@ const SELECTORS = {
     '[class*="thinking" i]',
     '[class*="pending" i]',
     '[class*="streaming" i]'
+  ],
+  // 個別のチャットアイテムを表すカスタム要素・コンテナ
+  chatItemContainers: [
+    'you-chat-item-view-model',
+    'yt-convo-item-view-model',
+    'ytd-conversational-ai-response-renderer',
+    'ytd-chat-item-renderer'
   ]
 };
 
@@ -128,86 +136,216 @@ function linkifyTimestamps(text, videoUrl) {
 }
 
 /**
- * 正規表現のエスケープ
+ * ボタン要素が「コピーボタン」または「AI回答下部のアクションボタン（高評価・低評価・コピー）」であるかを判定
+ * ※提案チップのボタン（テキストが入っているボタン）やヘッダーの閉じるボタンとは厳密に区別する
+ * @param {Element} btn
+ * @returns {boolean}
  */
-function escapeRegExp(str) {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function isCopyOrFeedbackButton(btn) {
+  if (!btn) return false;
+
+  // ヘッダー内や入力エリア内のボタンは除外
+  if (btn.closest('#header, .ytd-engagement-panel-title-header-renderer, ytd-comment-simplebox-renderer')) {
+    return false;
+  }
+
+  // 提案チップ内のボタンは除外
+  if (btn.closest('yt-chip-cloud-renderer, yt-chip-cloud-chip-renderer, [class*="chip" i]')) {
+    return false;
+  }
+
+  const label = (
+    btn.getAttribute('aria-label') ||
+    btn.getAttribute('title') ||
+    btn.getAttribute('data-tooltip-text') ||
+    ''
+  ).toLowerCase();
+
+  // 1. aria-label 等で明示的にコピーボタンとわかる場合
+  if (/コピー|copy/i.test(label)) {
+    return true;
+  }
+
+  // 2. 高評価・低評価ボタン（AI回答アクションバーの構成要素）
+  if (/高評価|低評価|役に立った|役に立たなかった|good|bad|like|dislike|helpful/i.test(label)) {
+    return true;
+  }
+
+  return false;
 }
 
 /**
- * テキストからプロンプト全文の塊および初期挨拶のみを安全に除去
- * （AI回答内の見出しや正当な文章は一切削除しない）
+ * チャットアイテム要素が「AI回答のアクションバー（アイコンボタン群）」を持っているか判定
+ * 初期挨拶（ボタンなし）、ユーザー質問（ボタンなし）、提案チップ（文字入りボタン）を除外し、
+ * アイコンボタン（👍 👎 📋）を持つAI回答アイテムのみを識別する
+ * @param {Element} itemEl
+ * @returns {Element|null} アクションバーまたはコピーボタン要素
  */
-function stripSentPromptSafely(text, promptText) {
-  if (!text) return '';
+function findActionAnchorInItem(itemEl) {
+  if (!itemEl) return null;
 
-  // 1. パネル初期表示の固定システム案内文のみを先頭から除去
-  text = text.replace(/^\s*こんにちは。視聴しているコンテンツについて、ご質問にお答えします。\s*/g, '');
-  text = text.replace(/^\s*何を質問すればいいかわからない場合、次のいずれかを選択してください。\s*/g, '');
+  // 提案チップコンテナそのものなら除外
+  const tag = itemEl.tagName.toLowerCase();
+  if (tag.includes('chip') || itemEl.querySelector('yt-chip-cloud-chip-renderer')) {
+    return null;
+  }
 
-  // 2. 送信されたプロンプト全文が含まれている場合、最後に出現するプロンプト塊の直後（＝最新のAI回答）を取得
-  if (promptText && promptText.trim().length > 10) {
-    const promptLines = promptText.trim().split('\n').map(l => l.trim()).filter(Boolean);
-    if (promptLines.length >= 2) {
-      const firstLine = escapeRegExp(promptLines[0]);
-      const lastLine = escapeRegExp(promptLines[promptLines.length - 1]);
-      // プロンプトの先頭行から末尾行までの最短一致パターン（AI回答内の見出しにはマッチしない）
-      const fullPromptPattern = new RegExp(`${firstLine}[\\s\\S]*?${lastLine}`, 'g');
-      
-      let match;
-      let lastEndIndex = -1;
-      while ((match = fullPromptPattern.exec(text)) !== null) {
-        lastEndIndex = match.index + match[0].length;
-      }
+  const buttons = Array.from(itemEl.querySelectorAll('button, yt-button-shape, yt-icon-button, [role="button"]'));
+  if (buttons.length === 0) return null;
 
-      if (lastEndIndex !== -1) {
-        // 最後のプロンプトの直後から末尾まで（＝最新のAI回答全文）を切り出す
-        text = text.slice(lastEndIndex).trim();
-      }
-    } else if (promptLines.length === 1) {
-      const singlePrompt = promptLines[0];
-      const lastIdx = text.lastIndexOf(singlePrompt);
-      if (lastIdx !== -1) {
-        text = text.slice(lastIdx + singlePrompt.length).trim();
-      }
+  // 1. 明示的なコピー・フィードバックボタンを探す
+  for (const btn of buttons) {
+    if (isCopyOrFeedbackButton(btn)) {
+      return btn;
     }
   }
 
-  // 3. デフォルトの「動画を要約して」ボタンで生成した場合の先頭プロンプト除去
-  text = text.replace(/^\s*動画を要約して\s*\n+/, '');
+  // 2. テキストを持たないアイコン専用ボタン（👍 👎 📋）が2つ以上並んでいる箇所を探す
+  // （提案チップのボタンは質問テキストが入っているため visibleText.length > 2 となり除外される）
+  const iconOnlyButtons = buttons.filter(btn => {
+    if (btn.closest('yt-chip-cloud-renderer, yt-chip-cloud-chip-renderer, [class*="chip" i], #header')) {
+      return false;
+    }
+    const visibleText = (btn.innerText || btn.textContent || '').trim();
+    const hasIcon = btn.querySelector('svg, yt-icon, path') !== null;
+    // ボタン自体の表示文字が空（または空白のみ）でアイコンを持つもの
+    return visibleText.length === 0 && hasIcon;
+  });
 
-  return text.trim();
+  if (iconOnlyButtons.length >= 2) {
+    // 最後のアイコンボタン（＝コピーボタン）を返す
+    return iconOnlyButtons[iconOnlyButtons.length - 1];
+  }
+
+  return null;
 }
 
 /**
- * 抽出したテキストを整形（回答内の疑問文や見出しは保持）
+ * パネル内から「コピーボタン（アクションバー）を持つAI回答ブロック」をすべてDOM順（古い順）に取得
+ * @param {Element} panel
+ * @returns {Array<{ container: Element, anchorBtn: Element }>}
  */
-function cleanExtractedText(rawText, videoUrl, promptText) {
-  if (!rawText) return '';
+function findAiResponseBlocksByCopyAnchor(panel) {
+  if (!panel) return [];
+  const root = panel.shadowRoot || panel;
+  const results = [];
+  const seenContainers = new Set();
 
-  let lines = rawText.split('\n').map(l => l.trim());
+  // 方法1: チャットアイテムタグ（you-chat-item-view-model 等）ごとに走査
+  const itemSelector = SELECTORS.chatItemContainers.join(', ');
+  const chatItems = Array.from(root.querySelectorAll(itemSelector));
 
-  // パネル枠のUIラベルのみを完全一致で除外（回答本文の疑問文「?」等は絶対に削除しない）
-  const uiLabels = [
-    /^この動画について質問する$/i,
-    /^質問を入力$/i,
-    /^Gemini\s*に質問する$/i,
-    /^AI\s*は不正確な情報を表示することがあるため[^\n]*$/i,
-    /^詳細$/i
-  ];
-
-  lines = lines.filter(line => {
-    if (!line) return false;
-    for (const pat of uiLabels) {
-      if (pat.test(line)) return false;
+  if (chatItems.length > 0) {
+    for (const item of chatItems) {
+      const anchorBtn = findActionAnchorInItem(item);
+      if (anchorBtn && !seenContainers.has(item)) {
+        // 本文テキストが存在するか確認
+        const textLen = (item.innerText || item.textContent || '').trim().length;
+        if (textLen >= 20) {
+          seenContainers.add(item);
+          results.push({ container: item, anchorBtn });
+        }
+      }
     }
-    return true;
+    if (results.length > 0) {
+      return results;
+    }
+  }
+
+  // 方法2: パネル内のコピーボタンを直接探し、そこから対応する回答ブロックを逆引きする
+  const allButtons = Array.from(root.querySelectorAll('button, yt-button-shape, yt-icon-button, [role="button"]'));
+  const copyButtons = allButtons.filter(btn => {
+    const label = (btn.getAttribute('aria-label') || btn.getAttribute('title') || '').toLowerCase();
+    return /コピー|copy/i.test(label) && !btn.closest('#header, yt-chip-cloud-renderer');
   });
 
-  let text = lines.join('\n\n');
+  for (const copyBtn of copyButtons) {
+    // コピーボタンから親方向へ辿り、本文を含む最小の回答ブロックを特定する
+    let current = copyBtn.parentElement;
+    let matchedContainer = null;
 
-  // プロンプト塊の安全な除去（最新回答の抽出）
-  text = stripSentPromptSafely(text, promptText);
+    while (current && current !== panel && current !== root && current.tagName.toLowerCase() !== 'body') {
+      // パネル全体のスクロール領域（複数の回答をまとめている親）まで行く手前で止める
+      const ownText = (current.innerText || current.textContent || '').trim();
+      if (ownText.length >= 20) {
+        matchedContainer = current;
+        // もしそのコンテナ内にコピーボタンが1つだけなら、それが個別回答ブロック！
+        const copyCountInCurrent = copyButtons.filter(b => current.contains(b)).length;
+        if (copyCountInCurrent === 1) {
+          // さらに親も同じ1つだけなら、挨拶やユーザー質問を含まない範囲で適切なラッパーを選ぶ
+          const parent = current.parentElement;
+          if (parent && parent !== panel && parent !== root) {
+            const copyCountInParent = copyButtons.filter(b => parent.contains(b)).length;
+            // 親がチャットリスト全体（複数アイテムを持つコンテナ）でなければ親を見る
+            if (copyCountInParent > 1 || parent.id === 'contents' || parent.id === 'items' || parent.id === 'content') {
+              break;
+            }
+          }
+          break;
+        }
+      }
+      current = current.parentElement;
+    }
+
+    if (matchedContainer && !seenContainers.has(matchedContainer)) {
+      seenContainers.add(matchedContainer);
+      results.push({ container: matchedContainer, anchorBtn: copyBtn });
+    }
+  }
+
+  return results;
+}
+
+/**
+ * 特定された単一のAI回答ブロックから、アクションバーや免責事項を除いた「純粋な回答本文」のみを抽出する
+ * @param {Element} container - AI回答ブロック要素
+ * @param {string} videoUrl - 動画URL
+ * @returns {string} 整形済みMarkdown本文
+ */
+function extractCleanBodyFromAiBlock(container, videoUrl) {
+  if (!container) return '';
+
+  // クローンを作成して不要な付属要素（ボタンバー、免責事項、アイコン等）だけを除去
+  const clone = container.cloneNode(true);
+
+  const removeSelectors = [
+    'button',
+    'yt-button-shape',
+    'yt-icon-button',
+    'yt-icon',
+    'svg',
+    'tp-yt-paper-tooltip',
+    'yt-chip-cloud-renderer',
+    'yt-chip-cloud-chip-renderer',
+    '[role="button"]',
+    '[class*="feedback" i]',
+    '[class*="action" i]',
+    '[class*="disclaimer" i]',
+    '[class*="footer" i]'
+  ];
+
+  for (const sel of removeSelectors) {
+    try {
+      const els = clone.querySelectorAll(sel);
+      els.forEach(el => el.remove());
+    } catch {}
+  }
+
+  const rawText = clone.innerText || clone.textContent || '';
+  if (!rawText) return '';
+
+  // 行単位でシステム免責事項のみ除外（回答内の疑問文や見出しは100%そのまま保持！）
+  const lines = rawText
+    .split('\n')
+    .map(l => l.trim())
+    .filter(line => {
+      if (!line) return false;
+      if (/^AI\s*は不正確な情報を表示することがあるため/i.test(line)) return false;
+      if (/^詳細$/i.test(line)) return false;
+      return true;
+    });
+
+  let text = lines.join('\n\n');
 
   // 箇条書き記号の正規化
   text = text.replace(/^[ \t]*[•▪■・][ \t]*/gm, '- ');
@@ -219,52 +357,6 @@ function cleanExtractedText(rawText, videoUrl, promptText) {
   text = text.replace(/\n{3,}/g, '\n\n').trim();
 
   return text;
-}
-
-/**
- * パネルから不要なUI要素（ボタン・提案チップ・入力欄）を除いたテキストを取得
- */
-function extractPanelSummaryText(panel, videoUrl, promptText) {
-  if (!panel) return '';
-
-  const clone = panel.cloneNode(true);
-
-  // ボタン、提案チップ、入力欄、ヘッダー、免責事項をDOMレベルで削除
-  const removeSelectors = [
-    'button',
-    'yt-icon',
-    'svg',
-    'tp-yt-paper-tooltip',
-    'yt-chip-cloud-renderer',
-    'yt-chip-cloud-chip-renderer',
-    'ytd-comment-simplebox-renderer',
-    'textarea',
-    'input',
-    '#header',
-    '.ytd-engagement-panel-title-header-renderer',
-    '[class*="chip" i]',
-    '[class*="suggestion" i]',
-    '[class*="input" i]',
-    '[class*="disclaimer" i]',
-    '[class*="feedback" i]',
-    '[class*="action-bar" i]',
-    '[role="button"]'
-  ];
-
-  for (const sel of removeSelectors) {
-    try {
-      const elements = clone.querySelectorAll(sel);
-      elements.forEach(el => el.remove());
-    } catch {}
-  }
-
-  // cloneのinnerTextまたはパネルの可視テキストを取得
-  let rawText = clone.innerText || clone.textContent || '';
-  if (!rawText || rawText.trim().length < 20) {
-    rawText = panel.innerText || panel.textContent || '';
-  }
-
-  return cleanExtractedText(rawText, videoUrl, promptText);
 }
 
 function findInputAndSendButton(panel) {
@@ -289,8 +381,8 @@ function findInputAndSendButton(panel) {
 let automationState = {
   active: false,
   startTime: 0,
-  lastPrompt: '',
-  baselineText: '',
+  initialBlockCount: 0,
+  initialLastText: '',
   lastSeenLength: 0,
   stableCount: 0
 };
@@ -328,15 +420,17 @@ async function autoStartSummarize(promptText) {
     };
   }
 
-  // 送信前のパネル内テキストを記録（古い回答と新しい回答を確実に区別するため）
+  // 送信前の「コピーボタン付きAI回答ブロック」の数と最後の回答本文を記録
   const videoUrl = getCleanVideoUrl();
-  const baseline = extractPanelSummaryText(panel, videoUrl, promptText);
+  const existingBlocks = findAiResponseBlocksByCopyAnchor(panel);
+  const lastBlock = existingBlocks.length > 0 ? existingBlocks[existingBlocks.length - 1] : null;
+  const lastText = lastBlock ? extractCleanBodyFromAiBlock(lastBlock.container, videoUrl) : '';
 
   automationState = {
     active: true,
     startTime: Date.now(),
-    lastPrompt: promptText,
-    baselineText: baseline,
+    initialBlockCount: existingBlocks.length,
+    initialLastText: lastText,
     lastSeenLength: 0,
     stableCount: 0
   };
@@ -392,7 +486,10 @@ async function autoStartSummarize(promptText) {
 }
 
 /**
- * 生成状況のチェック（タイムアウト最優先＆ストリーミング安定完了検知）
+ * 生成状況のチェック
+ * 1. 90秒タイムアウトを最優先で判定
+ * 2. 新しい「コピーボタン付きAI回答ブロック」が出現したかを確認
+ * 3. スピナーが消え、本文テキストの出力が安定（ストリーミング完了）したかを確認
  */
 function checkAutomationStatus() {
   const panel = findActiveAskPanel();
@@ -402,41 +499,56 @@ function checkAutomationStatus() {
 
   const elapsedSec = Math.floor((Date.now() - automationState.startTime) / 1000);
 
-  // 1. タイムアウトを最優先で判定（90秒経過で確実に待機終了）
+  // 1. タイムアウト最優先判定（生成中表示が残っていても90秒で確実に終了）
   if (elapsedSec >= 90) {
     return { status: 'TIMEOUT', elapsedSec };
   }
 
-  // 送信直後（最初の4秒間）は生成開始待ち
-  if (elapsedSec < 4) {
+  // 送信直後（3秒以内）は待機
+  if (elapsedSec < 3) {
     return { status: 'GENERATING', elapsedSec };
   }
 
-  // スピナー表示中なら生成中
+  // 生成中スピナーが表示されている間は待機
   if (checkIsGenerating(panel)) {
     automationState.stableCount = 0;
     return { status: 'GENERATING', elapsedSec };
   }
 
-  // 現在の最新回答テキストを取得
-  const videoUrl = getCleanVideoUrl();
-  const currentSummary = extractPanelSummaryText(panel, videoUrl, automationState.lastPrompt);
+  // 2. コピーボタンを目印にAI回答ブロックを検索
+  const currentBlocks = findAiResponseBlocksByCopyAnchor(panel);
+  if (currentBlocks.length === 0) {
+    automationState.stableCount = 0;
+    return { status: 'GENERATING', elapsedSec };
+  }
 
-  // 2. 送信前の古い回答と同一、またはまだ50文字未満の場合は生成中として待機
-  if (!currentSummary || currentSummary.length < 50 || currentSummary === automationState.baselineText) {
+  const latestBlock = currentBlocks[currentBlocks.length - 1];
+  const videoUrl = getCleanVideoUrl();
+  const latestBody = extractCleanBodyFromAiBlock(latestBlock.container, videoUrl);
+
+  // 送信前の古い回答のままで、新しい回答がまだ来ていない場合は待機
+  const isNewBlockAdded = currentBlocks.length > automationState.initialBlockCount;
+  const isContentUpdated = latestBody !== automationState.initialLastText;
+
+  if (!isNewBlockAdded && !isContentUpdated) {
+    automationState.stableCount = 0;
+    return { status: 'GENERATING', elapsedSec };
+  }
+
+  if (!latestBody || latestBody.length < 30) {
     automationState.stableCount = 0;
     return { status: 'GENERATING', elapsedSec };
   }
 
   // 3. ストリーミング出力が完全に止まったか（文字数が安定したか）を確認
-  if (currentSummary.length === automationState.lastSeenLength) {
+  if (latestBody.length === automationState.lastSeenLength) {
     automationState.stableCount += 1;
   } else {
-    automationState.lastSeenLength = currentSummary.length;
+    automationState.lastSeenLength = latestBody.length;
     automationState.stableCount = 1;
   }
 
-  // 2回連続（約3秒間）文字数が変化せず安定していれば、生成完了と判定！
+  // コピーボタンが存在し、かつ文字数の増加が止まって安定したら完了！
   if (automationState.stableCount >= 2) {
     return { status: 'COMPLETED', elapsedSec };
   }
@@ -445,9 +557,9 @@ function checkAutomationStatus() {
 }
 
 /**
- * 要約データの抽出
+ * 要約データの抽出（コピーボタンを目印に最新のAI回答本文のみを取得）
  */
-function extractSummaryData(promptText) {
+function extractSummaryData() {
   const isYouTube = window.location.hostname.includes('youtube.com');
   const isWatchPage = window.location.pathname === '/watch' || window.location.search.includes('v=');
 
@@ -487,15 +599,27 @@ function extractSummaryData(promptText) {
     };
   }
 
-  const activePrompt = promptText || automationState.lastPrompt;
-  const finalMarkdown = extractPanelSummaryText(panel, videoUrl, activePrompt);
+  // コピーボタンを目印にすべてのAI回答ブロックを特定
+  const aiBlocks = findAiResponseBlocksByCopyAnchor(panel);
+  if (aiBlocks.length === 0) {
+    return {
+      success: false,
+      errorType: 'NO_RESPONSE_FOUND',
+      title: 'AI回答が見つかりません',
+      message: 'コピー可能なAI回答がパネル内に見つかりませんでした。回答が表示されてから実行してください。'
+    };
+  }
 
-  if (!finalMarkdown || finalMarkdown.length < 20) {
+  // 複数の回答がある場合も、常に「最後のAI回答ブロック」を選択
+  const latestAiBlock = aiBlocks[aiBlocks.length - 1];
+  const finalMarkdown = extractCleanBodyFromAiBlock(latestAiBlock.container, videoUrl);
+
+  if (!finalMarkdown || finalMarkdown.length < 15) {
     return {
       success: false,
       errorType: 'EMPTY_CONTENT',
       title: '要約本文の取得に失敗しました',
-      message: '質問パネル内に要約テキストが検出されませんでした。画面に回答が表示されているかご確認ください。'
+      message: 'AI回答ブロックから本文テキストを抽出できませんでした。'
     };
   }
 
@@ -531,7 +655,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   if (request.action === 'EXTRACT_SUMMARY') {
     try {
-      const result = extractSummaryData(request.prompt);
+      const result = extractSummaryData();
       sendResponse(result);
     } catch (err) {
       sendResponse({

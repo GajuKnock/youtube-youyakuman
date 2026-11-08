@@ -131,6 +131,16 @@ function getGuidanceForError(errorType) {
       return ['手動で「この動画について質問する」ボタンを押してパネルを開いてからお試しください。'];
     case 'INPUT_NOT_FOUND':
       return ['質問パネル内にテキスト入力欄が見つかりませんでした。一度パネルを開き直してください。'];
+    case 'NO_RESPONSE_FOUND':
+      return [
+        '質問パネル内にコピー可能なAIの回答がまだ表示されていません。',
+        '「ワンクリックで詳細要約＆保存」を押すか、回答の出力が完了してから実行してください。'
+      ];
+    case 'IS_GENERATING':
+      return [
+        '現在AIの回答を生成中です。',
+        '回答の出力が完了し、下部にコピーボタンが表示されてから再度押してください。'
+      ];
     case 'TIMEOUT':
       return [
         '回答の生成に通常より時間がかかっています。',
